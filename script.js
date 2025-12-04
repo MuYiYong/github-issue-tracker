@@ -19,7 +19,10 @@ const STORAGE_KEYS = {
 
 const GITHUB_GRAPHQL = "https://api.github.com/graphql";
 const ASSIGNEE_PAGE_SIZE = 10;
+const PAGE_SIZE = 100;
+const MAX_CONCURRENT = 6; // 最大并发数
 
+// 全局状态
 let cachedIssues = [];
 let filters = {
     state: null,
@@ -31,99 +34,301 @@ let filters = {
 };
 let assigneePage = 0;
 
+// 当前请求的 AbortController
+let currentAbortController = null;
+
+// 缓存 Chart 实例
+const chartInstances = new Map();
+
+// DOM 元素缓存（仅缓存静态元素）
+const staticDomCache = new Map();
+
+/* ---------------- 工具函数 ---------------- */
+
+/**
+ * 获取 DOM 元素（带缓存，仅用于静态元素）
+ */
+const STATIC_ELEMENTS = new Set([
+    "loading-container", "loading-text", "loading-percent", 
+    "loading-bar-fill", "loading-detail", "fetch-btn",
+    "token-status", "token-input", "project-select", "last-fetch-time"
+]);
+
+function getElement(id, useCache = true) {
+    const canCache = useCache && STATIC_ELEMENTS.has(id);
+    
+    if (canCache && staticDomCache.has(id)) {
+        return staticDomCache.get(id);
+    }
+    
+    const el = document.getElementById(id);
+    
+    if (canCache && el) {
+        staticDomCache.set(id, el);
+    }
+    
+    return el;
+}
+
+/**
+ * 安全地设置元素文本
+ */
+function setText(el, text) {
+    if (el) el.textContent = text;
+}
+
+/**
+ * 安全地设置元素 HTML
+ */
+function setHTML(el, html) {
+    if (el) el.innerHTML = html;
+}
+
+/**
+ * 防抖函数
+ */
+function debounce(fn, delay) {
+    let timer = null;
+    return function(...args) {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => fn.apply(this, args), delay);
+    };
+}
+
+/**
+ * 按值排序对象
+ */
+function sortObjectByValue(obj, desc = true) {
+    return Object.entries(obj)
+        .sort((a, b) => desc ? b[1] - a[1] : a[1] - b[1])
+        .reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});
+}
+
+/**
+ * 获取优先级样式类
+ */
+function getPriorityClass(priority) {
+    if (!priority) return "none";
+    const lower = priority.toLowerCase();
+    if (/p0|high|critical/.test(lower)) return "high";
+    if (/p1|medium/.test(lower)) return "medium";
+    if (/p2|low/.test(lower)) return "low";
+    return "none";
+}
+
+/**
+ * 格式化日期
+ */
+function formatDate(dateStr) {
+    if (!dateStr) return "未知";
+    try {
+        return new Date(dateStr).toLocaleString();
+    } catch {
+        return "未知";
+    }
+}
+
+/**
+ * 生成安全的 ID
+ */
+function safeId(str) {
+    return String(str || "").replace(/[^a-zA-Z0-9]/g, "_");
+}
+
 /* ---------------- 页面初始化 ---------------- */
 document.addEventListener("DOMContentLoaded", () => {
     initTabs();
+    initEventDelegation();
     updateTokenStatus();
-    loadCachedData();
     loadProjectSelect();
     updateLastFetchTime();
+    loadCachedData();
 });
 
 /* ---------------- Tab 切换 ---------------- */
 function initTabs() {
-    const tabs = document.querySelectorAll(".nav-tab");
-    tabs.forEach(tab => {
+    const navTabs = document.querySelectorAll(".nav-tab");
+    const tabContents = document.querySelectorAll(".tab-content");
+    
+    navTabs.forEach(tab => {
         tab.addEventListener("click", () => {
             const targetTab = tab.dataset.tab;
             
-            // 更新 tab 状态
-            tabs.forEach(t => t.classList.remove("active"));
-            tab.classList.add("active");
-            
-            // 更新内容显示
-            document.querySelectorAll(".tab-content").forEach(content => {
-                content.classList.remove("active");
+            requestAnimationFrame(() => {
+                // 更新 Tab 状态
+                navTabs.forEach(t => t.classList.toggle("active", t === tab));
+                
+                // 更新内容区域
+                tabContents.forEach(content => {
+                    content.classList.toggle("active", content.id === `tab-${targetTab}`);
+                });
             });
-            document.getElementById(`tab-${targetTab}`).classList.add("active");
         });
     });
 }
 
+/* ---------------- 事件委托 ---------------- */
+function initEventDelegation() {
+    document.addEventListener("click", handleGlobalClick);
+}
+
+function handleGlobalClick(e) {
+    const target = e.target;
+    
+    // 处理展开/折叠子 Issue
+    const toggleArrow = target.closest(".toggle-arrow");
+    if (toggleArrow) {
+        e.preventDefault();
+        const toggleId = toggleArrow.dataset.toggle;
+        if (toggleId) toggleChildren(toggleId);
+        return;
+    }
+    
+    // 处理标签点击过滤
+    const labelTag = target.closest(".label-tag");
+    if (labelTag && labelTag.dataset.filterType) {
+        e.preventDefault();
+        handleLabelFilter(labelTag);
+        return;
+    }
+    
+    // 处理分页按钮
+    const paginationBtn = target.closest(".pagination-btn");
+    if (paginationBtn && !paginationBtn.disabled) {
+        e.preventDefault();
+        const delta = paginationBtn.dataset.delta;
+        const type = paginationBtn.dataset.type;
+        if (delta && type) handlePageChange(parseInt(delta), type);
+        return;
+    }
+}
+
+/**
+ * 处理标签过滤点击
+ */
+function handleLabelFilter(labelTag) {
+    const filterType = labelTag.dataset.filterType;
+    const filterValue = labelTag.dataset.filterValue;
+    const isWorkload = labelTag.dataset.isWorkload === "true";
+    
+    // 重置分配人分页
+    assigneePage = 0;
+    
+    if (isWorkload) {
+        handleWorkloadFilter(filterValue);
+    } else {
+        handleNormalFilter(filterType, filterValue);
+    }
+    
+    // 添加这行：刷新统计界面
+    refreshStats();
+}
+
+function handleWorkloadFilter(filterValue) {
+    if (filterValue === "all") {
+        filters.team = null;
+        filters.hasEstimation = null;
+    } else if (filterValue === "no-estimation") {
+        filters.hasEstimation = filters.hasEstimation === false ? null : false;
+        if (filters.hasEstimation === false) filters.team = null;
+    } else {
+        if (filters.team === filterValue && filters.hasEstimation === true) {
+            filters.team = null;
+            filters.hasEstimation = null;
+        } else {
+            filters.team = filterValue;
+            filters.hasEstimation = true;
+        }
+    }
+}
+
+function handleNormalFilter(filterType, filterValue) {
+    if (filterValue === "all") {
+        filters[filterType] = null;
+    } else if (filters[filterType] === filterValue) {
+        filters[filterType] = null;
+    } else {
+        filters[filterType] = filterValue;
+    }
+}
+
+/**
+ * 处理分页变化
+ */
+function handlePageChange(delta, type) {
+    assigneePage = Math.max(0, assigneePage + delta);
+    
+    // 只更新分配人标签区域
+    const container = document.getElementById(`labels-${type}`);
+    if (container) {
+        // 使用当前过滤后的数据重新计算
+        const filteredIssues = applyFilters(cachedIssues);
+        const stats = getStatsData(filteredIssues);
+        
+        const category = {
+            type,
+            data: stats.assigneeStats,
+            colors: getAssigneeColors(),
+            paginated: true
+        };
+        renderPaginatedLabels(category, container);
+    }
+}
+
 /* ---------------- Loading Progress ---------------- */
 function showLoading(text = "正在加载...", detail = "") {
-    const container = document.getElementById("loading-container");
-    const textEl = document.getElementById("loading-text");
-    const percentEl = document.getElementById("loading-percent");
-    const fillEl = document.getElementById("loading-bar-fill");
-    const detailEl = document.getElementById("loading-detail");
-    const btn = document.getElementById("fetch-btn");
-    
-    if (container) {
-        container.classList.remove("hidden");
-    }
-    if (textEl) textEl.textContent = text;
-    if (percentEl) percentEl.textContent = "0%";
-    if (fillEl) fillEl.style.width = "0%";
-    if (detailEl) detailEl.textContent = detail;
-    if (btn) btn.classList.add("loading");
+    requestAnimationFrame(() => {
+        const container = getElement("loading-container");
+        const textEl = getElement("loading-text");
+        const percentEl = getElement("loading-percent");
+        const fillEl = getElement("loading-bar-fill");
+        const detailEl = getElement("loading-detail");
+        const btn = getElement("fetch-btn");
+        
+        if (container) container.classList.remove("hidden");
+        setText(textEl, text);
+        setText(percentEl, "0%");
+        if (fillEl) fillEl.style.width = "0%";
+        setText(detailEl, detail);
+        if (btn) btn.classList.add("loading");
+    });
 }
 
 function updateLoading(percent, text = null, detail = null) {
-    const percentEl = document.getElementById("loading-percent");
-    const fillEl = document.getElementById("loading-bar-fill");
-    const textEl = document.getElementById("loading-text");
-    const detailEl = document.getElementById("loading-detail");
-    
-    if (percentEl) percentEl.textContent = `${Math.round(percent)}%`;
-    if (fillEl) fillEl.style.width = `${percent}%`;
-    if (text && textEl) textEl.textContent = text;
-    if (detail !== null && detailEl) detailEl.textContent = detail;
+    requestAnimationFrame(() => {
+        const percentEl = getElement("loading-percent");
+        const fillEl = getElement("loading-bar-fill");
+        
+        setText(percentEl, `${Math.round(percent)}%`);
+        if (fillEl) fillEl.style.width = `${percent}%`;
+        
+        if (text !== null) setText(getElement("loading-text"), text);
+        if (detail !== null) setText(getElement("loading-detail"), detail);
+    });
 }
 
 function hideLoading() {
-    const container = document.getElementById("loading-container");
-    const btn = document.getElementById("fetch-btn");
-    
-    if (container) {
-        container.classList.add("hidden");
-    }
-    if (btn) btn.classList.remove("loading");
+    requestAnimationFrame(() => {
+        const container = getElement("loading-container");
+        const btn = getElement("fetch-btn");
+        
+        if (container) container.classList.add("hidden");
+        if (btn) btn.classList.remove("loading");
+    });
 }
 
-// 保留旧的函数兼容性
-function showLoadingBar() {
-    showLoading("正在加载数据...");
-}
-
-function hideLoadingBar() {
-    hideLoading();
-}
+// 精简 Token 管理
 
 /* ---------------- Token 管理 ---------------- */
-function loadToken() {
-    return localStorage.getItem(STORAGE_KEYS.TOKEN) || "";
-}
+const loadToken = () => localStorage.getItem(STORAGE_KEYS.TOKEN) || "";
 
 function saveToken() {
-    const input = document.getElementById("token-input");
-    const token = input.value.trim();
-    if (token) {
-        localStorage.setItem(STORAGE_KEYS.TOKEN, token);
-        input.value = "";
-        updateTokenStatus();
-        fetchProjects();
-    }
+    const token = getElement("token-input")?.value?.trim();
+    if (!token) return alert("请输入有效的 Token");
+    localStorage.setItem(STORAGE_KEYS.TOKEN, token);
+    getElement("token-input").value = "";
+    updateTokenStatus();
+    fetchProjects();
 }
 
 function clearToken() {
@@ -132,77 +337,95 @@ function clearToken() {
 }
 
 function updateTokenStatus() {
-    const status = document.getElementById("token-status");
+    const el = getElement("token-status");
+    if (!el) return;
     const token = loadToken();
-    if (status) {
-        if (token) {
-            status.className = "token-status success";
-            status.innerHTML = "✓ Token 已配置（" + token.substring(0, 8) + "...）";
-        } else {
-            status.className = "token-status error";
-            status.innerHTML = "✗ 未配置 Token";
-        }
-    }
+    el.className = `token-status ${token ? "success" : "error"}`;
+    el.textContent = token ? `✓ Token 已配置（${token.slice(0, 8)}...）` : "✗ 未配置 Token";
 }
 
 /* ---------------- 缓存管理 ---------------- */
 function loadCachedData() {
-    const cached = localStorage.getItem(STORAGE_KEYS.CACHED_ISSUES);
-    if (cached) {
-        try {
+    try {
+        const cached = localStorage.getItem(STORAGE_KEYS.CACHED_ISSUES);
+        if (cached) {
             cachedIssues = JSON.parse(cached);
             if (cachedIssues.length > 0) {
-                refreshStats();
+                // 延迟渲染，优先显示页面框架
+                if ("requestIdleCallback" in window) {
+                    requestIdleCallback(() => refreshStats(), { timeout: 500 });
+                } else {
+                    setTimeout(refreshStats, 100);
+                }
             }
-        } catch (e) {
-            cachedIssues = [];
         }
+    } catch (e) {
+        console.error("加载缓存失败:", e);
+        cachedIssues = [];
     }
 }
 
-function saveCachedIssues() {
-    localStorage.setItem(STORAGE_KEYS.CACHED_ISSUES, JSON.stringify(cachedIssues));
-}
+const saveCachedIssues = debounce(() => {
+    try {
+        localStorage.setItem(STORAGE_KEYS.CACHED_ISSUES, JSON.stringify(cachedIssues));
+    } catch (e) {
+        console.error("保存缓存失败:", e);
+        // 如果存储失败（可能是存储已满），尝试清理旧数据
+        try {
+            localStorage.removeItem(STORAGE_KEYS.CACHED_ISSUES);
+        } catch {}
+    }
+}, 300);
 
 function updateLastFetchTime() {
-    const timeEl = document.getElementById("last-fetch-time");
+    const timeEl = getElement("last-fetch-time");
     const lastFetch = localStorage.getItem(STORAGE_KEYS.LAST_FETCH_TIME);
+    
     if (timeEl && lastFetch) {
-        timeEl.textContent = "上次更新: " + new Date(parseInt(lastFetch)).toLocaleString();
+        const date = new Date(parseInt(lastFetch));
+        timeEl.textContent = `上次更新: ${date.toLocaleString()}`;
     }
 }
 
 /* ---------------- 项目管理 ---------------- */
 function loadProjectSelect() {
-    const select = document.getElementById("project-select");
+    const select = getElement("project-select");
+    if (!select) return;
+    
     const saved = localStorage.getItem(STORAGE_KEYS.PROJECTS);
     const selectedProject = localStorage.getItem(STORAGE_KEYS.SELECTED_PROJECT);
     
-    if (!select) return;
+    // 使用 DocumentFragment 批量操作
+    const fragment = document.createDocumentFragment();
     
-    select.innerHTML = '<option value="">-- 请选择 --</option>';
+    const defaultOpt = document.createElement("option");
+    defaultOpt.value = "";
+    defaultOpt.textContent = "-- 请选择 --";
+    fragment.appendChild(defaultOpt);
     
     if (saved) {
         try {
             const projects = JSON.parse(saved);
             projects.forEach(p => {
                 const opt = document.createElement("option");
-                opt.value = JSON.stringify(p);
+                const value = JSON.stringify(p);
+                opt.value = value;
                 opt.textContent = `${p.owner} / ${p.title}`;
-                if (selectedProject === JSON.stringify(p)) {
-                    opt.selected = true;
-                }
-                select.appendChild(opt);
+                opt.selected = selectedProject === value;
+                fragment.appendChild(opt);
             });
         } catch (e) {
-            console.error("加载项目列表失败", e);
+            console.error("加载项目列表失败:", e);
         }
     }
+    
+    select.innerHTML = "";
+    select.appendChild(fragment);
 }
 
 function saveSelectedProject() {
-    const select = document.getElementById("project-select");
-    if (select && select.value) {
+    const select = getElement("project-select");
+    if (select?.value) {
         localStorage.setItem(STORAGE_KEYS.SELECTED_PROJECT, select.value);
     }
 }
@@ -215,34 +438,20 @@ async function fetchProjects() {
         return;
     }
     
-    showLoadingBar();
+    showLoading("正在获取项目列表...");
     
     const query = `
     query {
         viewer {
             login
             projectsV2(first: 50) {
-                nodes {
-                    title
-                    number
-                    owner {
-                        ... on Organization { login }
-                        ... on User { login }
-                    }
-                }
+                nodes { title number owner { ... on Organization { login } ... on User { login } } }
             }
             organizations(first: 20) {
                 nodes {
                     login
                     projectsV2(first: 50) {
-                        nodes {
-                            title
-                            number
-                            owner {
-                                ... on Organization { login }
-                                ... on User { login }
-                            }
-                        }
+                        nodes { title number owner { ... on Organization { login } ... on User { login } } }
                     }
                 }
             }
@@ -262,42 +471,57 @@ async function fetchProjects() {
         const json = await res.json();
         
         if (json.errors) {
-            hideLoadingBar();
+            hideLoading();
             alert("获取项目失败：" + json.errors[0].message);
             return;
         }
         
         const projects = [];
+        const viewer = json.data?.viewer;
+        
+        if (!viewer) {
+            hideLoading();
+            alert("无法获取用户信息，请检查 Token");
+            return;
+        }
         
         // 用户项目
-        json.data.viewer.projectsV2.nodes.forEach(p => {
-            projects.push({
-                title: p.title,
-                number: p.number,
-                owner: p.owner.login,
-                ownerType: "User"
-            });
-        });
-        
-        // 组织项目
-        json.data.viewer.organizations.nodes.forEach(org => {
-            org.projectsV2.nodes.forEach(p => {
+        viewer.projectsV2?.nodes?.forEach(p => {
+            if (p?.title && p?.number && p?.owner?.login) {
                 projects.push({
                     title: p.title,
                     number: p.number,
                     owner: p.owner.login,
-                    ownerType: "Organization"
+                    ownerType: "User"
                 });
+            }
+        });
+        
+        // 组织项目
+        viewer.organizations?.nodes?.forEach(org => {
+            org?.projectsV2?.nodes?.forEach(p => {
+                if (p?.title && p?.number && p?.owner?.login) {
+                    projects.push({
+                        title: p.title,
+                        number: p.number,
+                        owner: p.owner.login,
+                        ownerType: "Organization"
+                    });
+                }
             });
         });
         
         localStorage.setItem(STORAGE_KEYS.PROJECTS, JSON.stringify(projects));
         loadProjectSelect();
+        hideLoading();
         
-        hideLoadingBar();
+        if (projects.length === 0) {
+            alert("未找到任何项目，请确认您有权限访问 GitHub Projects");
+        }
         
     } catch (err) {
-        hideLoadingBar();
+        hideLoading();
+        console.error("获取项目失败:", err);
         alert("网络错误：" + err.message);
     }
 }
@@ -310,722 +534,14 @@ async function fetchAndRefresh() {
         saveCachedIssues();
         localStorage.setItem(STORAGE_KEYS.LAST_FETCH_TIME, Date.now().toString());
         updateLastFetchTime();
+        
+        // 重置过滤器和分页
+        resetFilters();
         refreshStats();
     }
 }
 
-/* ---------------- 从 Project 拉取 Issue ---------------- */
-async function fetchProjectIssues() {
-    const select = document.getElementById("project-select");
-    if (!select || !select.value) {
-        alert("请先选择一个项目");
-        return null;
-    }
-    
-    const token = loadToken();
-    if (!token) {
-        alert("请先配置 GitHub Token");
-        return null;
-    }
-    
-    const project = JSON.parse(select.value);
-    const { owner, number, ownerType } = project;
-    
-    saveSelectedProject();
-    
-    showLoading("正在获取 Issue 列表...", `项目: ${project.title}`);
-    
-    const ownerQuery = ownerType === "Organization" ? "organization" : "user";
-    
-    const query = `
-    query($owner: String!, $number: Int!, $cursor: String) {
-        ${ownerQuery}(login: $owner) {
-            projectV2(number: $number) {
-                title
-                items(first: 100, after: $cursor) {
-                    totalCount
-                    pageInfo {
-                        hasNextPage
-                        endCursor
-                    }
-                    nodes {
-                        content {
-                            ... on Issue {
-                                id
-                                number
-                                title
-                                state
-                                url
-                                updatedAt
-                                milestone { title }
-                                labels(first: 20) { nodes { name } }
-                                assignees(first: 10) { nodes { login } }
-                                repository {
-                                    name
-                                    owner { login }
-                                }
-                            }
-                        }
-                        fieldValues(first: 20) {
-                            nodes {
-                                ... on ProjectV2ItemFieldSingleSelectValue {
-                                    field { ... on ProjectV2SingleSelectField { name } }
-                                    name
-                                }
-                                ... on ProjectV2ItemFieldTextValue {
-                                    field { ... on ProjectV2FieldCommon { name } }
-                                    text
-                                }
-                                ... on ProjectV2ItemFieldDateValue {
-                                    field { ... on ProjectV2FieldCommon { name } }
-                                    date
-                                }
-                                ... on ProjectV2ItemFieldNumberValue {
-                                    field { ... on ProjectV2FieldCommon { name } }
-                                    number
-                                }
-                                ... on ProjectV2ItemFieldIterationValue {
-                                    field { ... on ProjectV2IterationField { name } }
-                                    title
-                                    startDate
-                                    duration
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }`;
-    
-    let allItems = [];
-    let cursor = null;
-    let projectTitle = project.title;
-    let totalCount = 0;
-    let pageNum = 0;
-    
-    try {
-        do {
-            pageNum++;
-            const res = await fetch(GITHUB_GRAPHQL, {
-                method: "POST",
-                headers: {
-                    Authorization: `Bearer ${token}`,
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({ 
-                    query, 
-                    variables: { owner, number, cursor } 
-                })
-            });
-            
-            const json = await res.json();
-            
-            if (json.errors) {
-                console.error("GraphQL errors:", json.errors);
-                hideLoading();
-                alert("GitHub API 错误：" + json.errors[0].message);
-                return null;
-            }
-            
-            const projectData = json.data[ownerQuery]?.projectV2;
-            
-            if (!projectData) {
-                hideLoading();
-                alert("无法找到该 Project，请检查权限");
-                return null;
-            }
-            
-            projectTitle = projectData.title;
-            const items = projectData.items;
-            
-            if (totalCount === 0) {
-                totalCount = items.totalCount;
-            }
-            
-            allItems = allItems.concat(items.nodes);
-            
-            // 更新进度（Issue 获取阶段占 50%）
-            const progress = Math.min((allItems.length / totalCount) * 50, 50);
-            updateLoading(progress, "正在获取 Issue 列表...", `已获取 ${allItems.length} / ${totalCount} 条`);
-            
-            cursor = items.pageInfo.hasNextPage ? items.pageInfo.endCursor : null;
-            
-        } while (cursor);
-        
-    } catch (err) {
-        console.error(err);
-        hideLoading();
-        alert("网络或请求错误，请检查 Token 和网络");
-        return null;
-    }
-    
-    updateLoading(50, "正在处理 Issue 数据...", `共 ${allItems.length} 条`);
-    
-    // 收集所有 Issue 基础数据
-    const issuesData = allItems
-        .filter(item => item.content && item.content.url)
-        .map(item => {
-            const content = item.content;
-            const fvals = item.fieldValues.nodes;
-            
-            // 获取 Status 字段
-            const statusField = fvals.find(f => f?.field?.name?.toLowerCase() === "status");
-            const projectStatus = statusField ? (statusField.name || statusField.text || "未知") : "未知";
-            
-            // 获取 Priority 字段
-            const priorityField = fvals.find(f => f?.field?.name?.toLowerCase() === "priority");
-            const priority = priorityField ? (priorityField.name || priorityField.text || "未设置") : "未设置";
-            
-            // 获取 FunctionType 字段
-            const funcField = fvals.find(f => f?.field?.name?.toLowerCase() === "functiontype");
-            const FunctionType = funcField ? (funcField.text || funcField.name) : "";
-            
-            // 获取 Estimation 字段
-            const estimationField = fvals.find(f => f?.field?.name?.toLowerCase() === "estimation");
-            let estimation = null;
-            if (estimationField && typeof estimationField.number === "number") {
-                estimation = estimationField.number;
-            }
-            
-            // 获取 Team 字段
-            const teamField = fvals.find(f => f?.field?.name?.toLowerCase() === "team");
-            const team = teamField ? (teamField.name || teamField.text || teamField.title || "未设置") : "未设置";
-            
-            const assignees = content.assignees?.nodes?.map(a => a.login) || [];
-            
-            return {
-                id: content.id,
-                owner: content.repository.owner.login,
-                repo: content.repository.name,
-                number: content.number,
-                url: content.url,
-                title: content.title,
-                state: projectStatus,
-                issueState: content.state,
-                milestone: content.milestone?.title || null,
-                updated_at: content.updatedAt,
-                labels: content.labels?.nodes?.map(n => n.name) || [],
-                priority: priority,
-                project_name: projectTitle,
-                FunctionType: FunctionType,
-                assignees: assignees,
-                estimation: estimation,
-                team: team,
-                parentId: null,
-                childIds: []
-            };
-        })
-        .filter(i => i.issueState !== "CLOSED");
-    
-    updateLoading(60, "正在获取父子关系...", `处理 ${issuesData.length} 个 Issue`);
-    
-    // 获取每个 Issue 的父子关系
-    await fetchParentChildRelationships(issuesData, token);
-    
-    updateLoading(100, "加载完成！", `共 ${issuesData.length} 个 Issue`);
-    
-    // 延迟隐藏，让用户看到完成状态
-    setTimeout(() => {
-        hideLoading();
-    }, 500);
-    
-    return issuesData;
-}
-
-/* 获取父子关系（带进度显示） */
-async function fetchParentChildRelationships(issues, token) {
-    const issueMap = new Map();
-    const issueByNodeId = new Map();
-    issues.forEach(i => {
-        issueMap.set(`${i.owner}/${i.repo}#${i.number}`, i);
-        issueByNodeId.set(i.id, i);
-    });
-    
-    const batchSize = 100;
-    const batches = [];
-    
-    for (let i = 0; i < issues.length; i += batchSize) {
-        batches.push(issues.slice(i, i + batchSize));
-    }
-    
-    // 逐批处理并更新进度
-    for (let i = 0; i < batches.length; i++) {
-        await fetchBatchParentChild(batches[i], token, issueMap, issueByNodeId);
-        
-        // 更新进度（父子关系阶段占 60% - 100%）
-        const progress = 60 + ((i + 1) / batches.length) * 40;
-        updateLoading(progress, "正在获取父子关系...", `批次 ${i + 1} / ${batches.length}`);
-    }
-}
-
-/* 批量获取父子关系 */
-async function fetchBatchParentChild(batch, token, issueMap, issueByNodeId) {
-    const queries = batch.map((issue, idx) => `
-        issue${idx}: node(id: "${issue.id}") {
-            ... on Issue {
-                id
-                number
-                parent {
-                    id
-                    number
-                    repository {
-                        owner { login }
-                        name
-                    }
-                }
-            }
-        }
-    `).join("\n");
-    
-    const query = `query { ${queries} }`;
-    
-    try {
-        const res = await fetch(GITHUB_GRAPHQL, {
-            method: "POST",
-            headers: {
-                Authorization: `Bearer ${token}`,
-                "Content-Type": "application/json",
-                "GraphQL-Features": "sub_issues"
-            },
-            body: JSON.stringify({ query })
-        });
-        
-        const json = await res.json();
-        
-        if (json.errors) {
-            console.warn("获取父子关系时出错:", json.errors);
-            return;
-        }
-        
-        batch.forEach((issue, idx) => {
-            const result = json.data[`issue${idx}`];
-            if (result?.parent) {
-                const parent = result.parent;
-                const parentKey = `${parent.repository.owner.login}/${parent.repository.name}#${parent.number}`;
-                
-                issue.parentId = parent.id;
-                
-                const parentIssue = issueMap.get(parentKey) || issueByNodeId.get(parent.id);
-                if (parentIssue) {
-                    if (!parentIssue.childIds.includes(issue.id)) {
-                        parentIssue.childIds.push(issue.id);
-                    }
-                }
-            }
-        });
-        
-    } catch (err) {
-        console.error("获取父子关系失败:", err);
-    }
-}
-
-/* 拉取并刷新统计 */
-async function fetchAndRefreshStats() {
-    const select = document.getElementById("project-select");
-    if (!select || !select.value) {
-        return alert("请先选择一个 Project");
-    }
-    
-    const issues = await fetchProjectIssues();
-    if (issues) {
-        cachedIssues = issues;
-        // 重置所有过滤器
-        filters = {
-            state: null,
-            priority: null,
-            milestone: null,
-            assignee: null,
-            team: null,
-            hasEstimation: null
-        };
-        assigneePage = 0;
-        
-        // 保存拉取时间
-        const now = new Date().toISOString();
-        localStorage.setItem(STORAGE_KEYS.LAST_FETCH_TIME, now);
-        updateLastFetchTimeDisplay();
-        
-        // 保存到缓存
-        saveCachedIssues();
-        
-        refreshStats();
-    }
-}
-
-/* 更新最后拉取时间显示 */
-function updateLastFetchTimeDisplay() {
-    const container = document.getElementById("last-fetch-time");
-    const lastFetchTime = localStorage.getItem(STORAGE_KEYS.LAST_FETCH_TIME);
-    
-    if (container) {
-        if (lastFetchTime) {
-            const date = new Date(lastFetchTime);
-            container.textContent = `最后更新时间：${date.toLocaleString()}`;
-            container.style.display = "block";
-        } else {
-            container.textContent = "";
-            container.style.display = "none";
-        }
-    }
-}
-
-/* ---------------- 统计页面专用函数 ---------------- */
-
-/* 获取用于统计的 Issue（过滤掉父 Issue 在列表中的子 Issue） */
-function getIssuesForStats(issues) {
-    // 构建 Issue ID 集合
-    const issueIdSet = new Set(issues.map(i => i.id));
-    
-    // 过滤掉父 Issue 在当前列表中的子 Issue
-    return issues.filter(issue => {
-        // 如果没有父 Issue，保留
-        if (!issue.parentId) return true;
-        // 如果父 Issue 不在当前列表中，保留
-        if (!issueIdSet.has(issue.parentId)) return true;
-        // 父 Issue 在列表中，过滤掉这个子 Issue
-        return false;
-    });
-}
-
-/* 生成统计数据 */
-function getStatsData(issues) {
-    // 获取用于统计的 Issue（排除父 Issue 在列表中的子 Issue）
-    const statsIssues = getIssuesForStats(issues);
-    
-    const stateStats = {};
-    const priorityStats = {};
-    const milestoneStats = {};
-    const assigneeStats = {};
-    const teamWorkloadStats = {};  // 每个 Team 的工作量总和
-    let noEstimationCount = 0;  // 未设置工作量的 Issue 数量
-    
-    statsIssues.forEach(i => {
-        const state = i.state || "未知";
-        const priority = i.priority || "未设置";
-        const milestone = i.milestone || "未设置";
-        const team = i.team || "未设置";
-        const estimation = i.estimation;
-        
-        stateStats[state] = (stateStats[state] || 0) + 1;
-        priorityStats[priority] = (priorityStats[priority] || 0) + 1;
-        milestoneStats[milestone] = (milestoneStats[milestone] || 0) + 1;
-        
-        // 统计工作量
-        if (estimation !== null && estimation > 0) {
-            teamWorkloadStats[team] = (teamWorkloadStats[team] || 0) + estimation;
-        } else {
-            noEstimationCount++;
-        }
-        
-        if (i.assignees && i.assignees.length > 0) {
-            i.assignees.forEach(a => {
-                assigneeStats[a] = (assigneeStats[a] || 0) + 1;
-            });
-        } else {
-            assigneeStats["未分配"] = (assigneeStats["未分配"] || 0) + 1;
-        }
-    });
-    
-    return { 
-        stateStats, 
-        priorityStats, 
-        milestoneStats, 
-        assigneeStats, 
-        teamWorkloadStats, 
-        noEstimationCount,
-        statsIssueCount: statsIssues.length,  // 用于统计的 Issue 数量
-        totalIssueCount: issues.length         // 总 Issue 数量（包含子 Issue）
-    };
-}
-
-/* 刷新统计界面 */
-function refreshStats() {
-    // 应用过滤器获取过滤后的 Issue
-    const filteredIssues = applyFilters(cachedIssues);
-    
-    const { 
-        stateStats, 
-        priorityStats, 
-        milestoneStats, 
-        assigneeStats, 
-        teamWorkloadStats, 
-        noEstimationCount,
-        statsIssueCount,
-        totalIssueCount
-    } = getStatsData(filteredIssues);
-    
-    const container = document.getElementById("stats-container");
-    
-    if (!container) return;
-    
-    container.innerHTML = "";
-    
-    // 显示统计说明
-    const statsInfo = document.createElement("div");
-    statsInfo.className = "stats-info";
-    if (statsIssueCount < totalIssueCount) {
-        statsInfo.innerHTML = `<span class="stats-note">📊 统计基于 ${statsIssueCount} 个顶层 Issue（已排除 ${totalIssueCount - statsIssueCount} 个子 Issue）</span>`;
-    } else {
-        statsInfo.innerHTML = `<span class="stats-note">📊 统计基于 ${statsIssueCount} 个 Issue</span>`;
-    }
-    container.appendChild(statsInfo);
-    
-    // 显示当前过滤条件
-    if (hasActiveFilters()) {
-        const filterInfo = document.createElement("div");
-        filterInfo.className = "filter-info";
-        
-        const activeFilters = [];
-        if (filters.state) activeFilters.push(`状态: ${filters.state}`);
-        if (filters.priority) activeFilters.push(`优先级: ${filters.priority}`);
-        if (filters.milestone) activeFilters.push(`里程碑: ${filters.milestone}`);
-        if (filters.assignee) activeFilters.push(`分配人: ${filters.assignee}`);
-        if (filters.team) activeFilters.push(`Team: ${filters.team}`);
-        if (filters.hasEstimation === true) activeFilters.push(`工作量: 有`);
-        if (filters.hasEstimation === false) activeFilters.push(`工作量: 未设置`);
-        
-        filterInfo.innerHTML = `
-            <span class="filter-label">当前过滤：${activeFilters.join(" + ")}</span>
-            <button class="btn btn-small btn-secondary" onclick="clearAllFilters()">清除全部</button>
-        `;
-        container.appendChild(filterInfo);
-    }
-    
-    // 对分配人按 Issue 数量降序排序
-    const sortedAssigneeStats = Object.entries(assigneeStats)
-        .sort((a, b) => b[1] - a[1])
-        .reduce((acc, [key, value]) => {
-            acc[key] = value;
-            return acc;
-        }, {});
-    
-    // 对 Team 工作量按值降序排序
-    const sortedTeamWorkloadStats = Object.entries(teamWorkloadStats)
-        .sort((a, b) => b[1] - a[1])
-        .reduce((acc, [key, value]) => {
-            acc[key] = value;
-            return acc;
-        }, {});
-    
-    // 添加"未设置"到工作量统计
-    const workloadDataWithNoEstimation = { ...sortedTeamWorkloadStats };
-    if (noEstimationCount > 0) {
-        workloadDataWithNoEstimation["未设置"] = noEstimationCount;
-    }
-    
-    const chartsRow = document.createElement("div");
-    chartsRow.className = "charts-row";
-    
-    const categories = [
-        { title: "状态", data: stateStats, type: "state", colors: ["#2da44e", "#cf222e", "#57606a", "#0969da", "#8250df", "#bf8700"] },
-        { title: "优先级", data: priorityStats, type: "priority", colors: ["#cf222e", "#bf8700", "#2da44e", "#6e7781"] },
-        { title: "里程碑", data: milestoneStats, type: "milestone", colors: ["#0969da", "#6f42c1", "#fd7e14", "#20c997"] },
-        { title: "工作量", data: workloadDataWithNoEstimation, type: "workload", colors: ["#8250df", "#0969da", "#2da44e", "#bf8700", "#cf222e", "#fd7e14", "#e83e8c", "#17a2b8", "#6e7781"], isWorkload: true },
-        { title: "分配人", data: sortedAssigneeStats, type: "assignee", colors: ["#0969da", "#6f42c1", "#fd7e14", "#20c997", "#e83e8c", "#17a2b8", "#2da44e", "#cf222e"], paginated: true }
-    ];
-    
-    categories.forEach((category, categoryIdx) => {
-        const chartWrapper = document.createElement("div");
-        chartWrapper.className = "chart-wrapper";
-        
-        const title = document.createElement("h3");
-        
-        // 如果是工作量，显示总计
-        if (category.isWorkload) {
-            const total = Object.entries(category.data)
-                .filter(([key]) => key !== "未设置")
-                .reduce((sum, [, value]) => sum + value, 0);
-            title.innerHTML = `${category.title} <span class="workload-total">(${total})</span>`;
-        } else {
-            title.textContent = category.title;
-        }
-        
-        // 如果该类型有过滤，显示标记
-        if (category.isWorkload) {
-            if (filters.team || filters.hasEstimation !== null) {
-                title.innerHTML += ` <span class="filter-active-mark">✓</span>`;
-            }
-        } else if (filters[category.type]) {
-            title.innerHTML += ` <span class="filter-active-mark">✓</span>`;
-        }
-        
-        chartWrapper.appendChild(title);
-        
-        const canvasContainer = document.createElement("div");
-        canvasContainer.className = "canvas-container";
-        
-        const canvas = document.createElement("canvas");
-        canvas.id = `chart-${category.type}`;
-        canvasContainer.appendChild(canvas);
-        chartWrapper.appendChild(canvasContainer);
-        
-        const labelsContainer = document.createElement("div");
-        labelsContainer.className = "chart-labels";
-        labelsContainer.id = `labels-${category.type}`;
-        
-        chartWrapper.appendChild(labelsContainer);
-        chartsRow.appendChild(chartWrapper);
-        
-        // 渲染标签
-        if (category.paginated) {
-            renderPaginatedLabels(category, labelsContainer);
-        } else if (category.isWorkload) {
-            renderWorkloadLabels(category, labelsContainer);
-        } else {
-            renderLabels(category, labelsContainer);
-        }
-        
-        setTimeout(() => {
-            renderPieChart(canvas.id, category, categoryIdx);
-        }, 0);
-    });
-    
-    container.appendChild(chartsRow);
-    
-    loadFilteredIssues();
-}
-
-/* 渲染工作量标签（显示 Team 的 Estimation 总和） */
-function renderWorkloadLabels(category, container) {
-    container.innerHTML = "";
-    const colors = category.colors;
-    
-    // 计算有工作量的总和（不包括"未设置"）
-    const totalWorkload = Object.entries(category.data)
-        .filter(([key]) => key !== "未设置")
-        .reduce((sum, [, value]) => sum + value, 0);
-    
-    // 添加 "全部" 标签
-    const allLabelTag = document.createElement("div");
-    allLabelTag.className = "label-tag";
-    allLabelTag.style.borderLeftColor = "#6e7781";
-    
-    const isAllActive = !filters.team && filters.hasEstimation === null;
-    if (isAllActive) {
-        allLabelTag.classList.add("active");
-    }
-    
-    allLabelTag.innerHTML = `<span class="label-text">全部</span><span class="label-count workload-value">${totalWorkload}</span>`;
-    
-    allLabelTag.addEventListener("click", () => {
-        filters.team = null;
-        filters.hasEstimation = null;
-        saveCachedIssues();
-        refreshStats();
-    });
-    
-    container.appendChild(allLabelTag);
-    
-    // 渲染有工作量的 Team
-    let colorIdx = 0;
-    Object.entries(category.data).forEach(([team, value]) => {
-        if (team === "未设置") return; // 最后渲染"未设置"
-        
-        const labelTag = document.createElement("div");
-        labelTag.className = "label-tag";
-        labelTag.style.borderLeftColor = colors[colorIdx % colors.length];
-        colorIdx++;
-        
-        const isActive = filters.team === team && filters.hasEstimation === true;
-        if (isActive) {
-            labelTag.classList.add("active");
-        }
-        
-        labelTag.innerHTML = `<span class="label-text">${team}</span><span class="label-count workload-value">${value}</span>`;
-        
-        labelTag.addEventListener("click", () => {
-            if (filters.team === team && filters.hasEstimation === true) {
-                filters.team = null;
-                filters.hasEstimation = null;
-            } else {
-                filters.team = team;
-                filters.hasEstimation = true;
-            }
-            
-            saveCachedIssues();
-            refreshStats();
-        });
-        
-        container.appendChild(labelTag);
-    });
-    
-    // 最后渲染"未设置"标签
-    if (category.data["未设置"]) {
-        const noEstimationTag = document.createElement("div");
-        noEstimationTag.className = "label-tag";
-        noEstimationTag.style.borderLeftColor = "#6e7781";
-        
-        const isActive = filters.hasEstimation === false;
-        if (isActive) {
-            noEstimationTag.classList.add("active");
-        }
-        
-        noEstimationTag.innerHTML = `<span class="label-text">未设置</span><span class="label-count">${category.data["未设置"]} 个</span>`;
-        
-        noEstimationTag.addEventListener("click", () => {
-            if (filters.hasEstimation === false) {
-                filters.team = null;
-                filters.hasEstimation = null;
-            } else {
-                filters.team = null;
-                filters.hasEstimation = false;
-            }
-            
-            saveCachedIssues();
-            refreshStats();
-        });
-        
-        container.appendChild(noEstimationTag);
-    }
-}
-
-/* ---------------- 应用过滤器 ---------------- */
-function applyFilters(issues) {
-    let result = [...issues];
-    
-    if (filters.state) {
-        result = result.filter(i => i.state === filters.state);
-    }
-    
-    if (filters.priority) {
-        result = result.filter(i => i.priority === filters.priority);
-    }
-    
-    if (filters.milestone) {
-        result = result.filter(i => (i.milestone || "未设置") === filters.milestone);
-    }
-    
-    if (filters.assignee) {
-        if (filters.assignee === "未分配") {
-            result = result.filter(i => !i.assignees || i.assignees.length === 0);
-        } else {
-            result = result.filter(i => i.assignees && i.assignees.includes(filters.assignee));
-        }
-    }
-    
-    // 按 Team 过滤
-    if (filters.team) {
-        result = result.filter(i => (i.team || "未设置") === filters.team);
-    }
-    
-    // 按是否有工作量过滤
-    if (filters.hasEstimation === true) {
-        result = result.filter(i => i.estimation !== null && i.estimation > 0);
-    } else if (filters.hasEstimation === false) {
-        result = result.filter(i => i.estimation === null || i.estimation === 0);
-    }
-    
-    return result;
-}
-
-/* 检查是否有任何过滤器激活 */
-function hasActiveFilters() {
-    return filters.state || filters.priority || filters.milestone || filters.assignee || filters.team || filters.hasEstimation !== null;
-}
-
-/* 清除所有过滤器 */
-function clearAllFilters() {
+function resetFilters() {
     filters = {
         state: null,
         priority: null,
@@ -1035,45 +551,640 @@ function clearAllFilters() {
         hasEstimation: null
     };
     assigneePage = 0;
-    saveCachedIssues();
-    refreshStats();
 }
 
-/* ---------------- 创建加载指示器 ---------------- */
-function showLoadingBar() {
-    const existing = document.querySelector(".loading-bar");
-    if (existing) existing.remove();
+/* ---------------- 从 Project 拉取 Issue（优化版） ---------------- */
+async function fetchProjectIssues() {
+    const select = getElement("project-select");
+    if (!select?.value) return alert("请先选择一个项目"), null;
     
-    const loadingBar = document.createElement("div");
-    loadingBar.className = "loading-bar";
-    loadingBar.innerHTML = `
-        <div class="loading-bar-progress"></div>
-        <div class="loading-bar-text">加载中...</div>
-    `;
-    document.body.appendChild(loadingBar);
+    const token = loadToken();
+    if (!token) return alert("请先配置 GitHub Token"), null;
     
-    return loadingBar;
-}
-
-function hideLoadingBar() {
-    const loadingBar = document.querySelector(".loading-bar");
-    if (loadingBar) {
-        loadingBar.classList.add("done");
-        setTimeout(() => loadingBar.remove(), 600);
+    let project;
+    try {
+        project = JSON.parse(select.value);
+    } catch {
+        return alert("项目数据格式错误"), null;
+    }
+    
+    saveSelectedProject();
+    showLoading("正在获取 Issue 列表...", `项目: ${project.title}`);
+    
+    const ownerQuery = project.ownerType === "Organization" ? "organization" : "user";
+    const query = buildQuery(ownerQuery);
+    
+    try {
+        // 取消之前的请求
+        if (currentAbortController) {
+            currentAbortController.abort();
+        }
+        currentAbortController = new AbortController();
+        const signal = currentAbortController.signal;
+        
+        // 获取第一页和总数
+        const first = await fetchPage(token, query, project.owner, project.number, null, signal);
+        if (!first.ok) return hideLoading(), alert(first.error), null;
+        
+        let allItems = first.items;
+        const { totalCount, projectTitle } = first;
+        
+        updateLoading(15, null, `已获取 ${allItems.length} / ${totalCount} 条`);
+        
+        // 并发获取剩余页面
+        if (first.hasNext) {
+            const remaining = await fetchAllPages(token, query, project.owner, project.number, first.cursor, totalCount, allItems.length);
+            allItems = allItems.concat(remaining);
+        }
+        
+        updateLoading(90, "正在处理数据...", `共 ${allItems.length} 条`);
+        
+        const issues = processItems(allItems, projectTitle);
+        
+        updateLoading(100, "加载完成！", `共 ${issues.length} 个有效 Issue`);
+        setTimeout(hideLoading, 200);
+        
+        return issues;
+    } catch (err) {
+        console.error("获取 Issue 失败:", err);
+        hideLoading();
+        return alert("请求错误：" + err.message), null;
     }
 }
 
-/* ---------------- 优先级样式 ---------------- */
-function priorityClass(p) {
-    if (!p) return "none";
-    if (/p0|high|critical/i.test(p)) return "high";
-    if (/p1|medium/i.test(p)) return "medium";
-    if (/p2|low/i.test(p)) return "low";
-    return "none";
+/**
+ * 构建 GraphQL 查询
+ */
+function buildQuery(ownerQuery) {
+    return `query($owner:String!,$number:Int!,$cursor:String){${ownerQuery}(login:$owner){projectV2(number:$number){title items(first:${PAGE_SIZE},after:$cursor){totalCount pageInfo{hasNextPage endCursor}nodes{content{...on Issue{id number title state url updatedAt milestone{title}labels(first:10){nodes{name}}assignees(first:5){nodes{login}}repository{name owner{login}}parent{id}}}fieldValues(first:15){nodes{...on ProjectV2ItemFieldSingleSelectValue{field{...on ProjectV2SingleSelectField{name}}name}...on ProjectV2ItemFieldNumberValue{field{...on ProjectV2FieldCommon{name}}number}}}}}}}}`;
 }
 
-/* 绘制饼图 */
-function renderPieChart(canvasId, category, idx) {
+/**
+ * 获取单页数据
+ */
+async function fetchPage(token, query, owner, number, cursor, signal = null) {
+    const options = {
+        method: "POST",
+        headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            "GraphQL-Features": "sub_issues"
+        },
+        body: JSON.stringify({ query, variables: { owner, number, cursor } })
+    };
+    
+    if (signal) options.signal = signal;
+    
+    const res = await fetch(GITHUB_GRAPHQL, options);
+    
+    if (!res.ok) return { ok: false, error: `HTTP ${res.status}` };
+    
+    const json = await res.json();
+    if (json.errors) return { ok: false, error: json.errors[0].message };
+    
+    const proj = json.data?.[Object.keys(json.data)[0]]?.projectV2;
+    if (!proj) return { ok: false, error: "无法找到该 Project" };
+    
+    const items = proj.items;
+    return {
+        ok: true,
+        items: items.nodes || [],
+        totalCount: items.totalCount || 0,
+        hasNext: items.pageInfo?.hasNextPage,
+        cursor: items.pageInfo?.endCursor,
+        projectTitle: proj.title
+    };
+}
+
+/**
+ * 并发获取所有剩余页面
+ */
+async function fetchAllPages(token, query, owner, number, startCursor, totalCount, fetched) {
+    const results = [];
+    let cursor = startCursor;
+    
+    while (cursor) {
+        const res = await fetchPage(token, query, owner, number, cursor);
+        
+        if (!res.ok) {
+            console.error("获取页面失败:", res.error);
+            break;
+        }
+        
+        results.push(...res.items);
+        cursor = res.hasNext ? res.cursor : null;
+        
+        const progress = Math.min(15 + ((fetched + results.length) / totalCount) * 70, 85);
+        updateLoading(progress, null, `已获取 ${fetched + results.length} / ${totalCount} 条`);
+    }
+    
+    return results;
+}
+
+/**
+ * 处理 Issue 数据
+ */
+function processItems(items, projectTitle) {
+    const issues = [];
+    const issueMap = new Map();
+    
+    for (let i = 0, len = items.length; i < len; i++) {
+        const content = items[i]?.content;
+        if (!content?.url || content.state === "CLOSED") continue;
+        
+        const fields = items[i].fieldValues?.nodes;
+        let status, priority, estimation, team, funcType;
+        
+        if (fields) {
+            for (const f of fields) {
+                const name = f?.field?.name?.toLowerCase();
+                if (!name) continue;
+                const val = f.name ?? f.number;
+                if (name === FIELD_NAMES.STATUS) status = val;
+                else if (name === FIELD_NAMES.PRIORITY) priority = val;
+                else if (name === "estimation") estimation = val;
+                else if (name === "team") team = val;
+                else if (name === "functiontype") funcType = val;
+            }
+        }
+        
+        const issue = {
+            id: content.id,
+            owner: content.repository?.owner?.login || "",
+            repo: content.repository?.name || "",
+            number: content.number,
+            url: content.url,
+            title: content.title || "",
+            state: status || "未知",
+            issueState: content.state,
+            milestone: content.milestone?.title || null,
+            updated_at: content.updatedAt,
+            labels: content.labels?.nodes?.map(n => n.name) || [],
+            priority: priority || "未设置",
+            project_name: projectTitle,
+            FunctionType: funcType || "",
+            assignees: content.assignees?.nodes?.map(a => a.login) || [],
+            estimation: typeof estimation === "number" ? estimation : null,
+            team: team || "未设置",
+            parentId: content.parent?.id || null,
+            childIds: []
+        };
+        
+        issues.push(issue);
+        issueMap.set(issue.id, issue);
+    }
+    
+    // 建立父子关系
+    for (const issue of issues) {
+        if (issue.parentId) {
+            issueMap.get(issue.parentId)?.childIds.push(issue.id);
+        }
+    }
+    
+    return issues;
+}
+
+/* ---------------- 统计相关函数 ---------------- */
+
+/**
+ * 获取用于统计的 Issue（排除在列表中有父 Issue 的子 Issue）
+ */
+function getIssuesForStats(issues) {
+    const issueIdSet = new Set(issues.map(i => i.id));
+    return issues.filter(issue => !issue.parentId || !issueIdSet.has(issue.parentId));
+}
+
+/**
+ * 生成统计数据（带缓存）
+ */
+function getStatsData(issues) {
+    const statsIssues = getIssuesForStats(issues);
+    
+    const stats = {
+        stateStats: {},
+        priorityStats: {},
+        milestoneStats: {},
+        assigneeStats: {},
+        teamWorkloadStats: {},
+        noEstimationCount: 0,
+        statsIssueCount: statsIssues.length,
+        totalIssueCount: issues.length
+    };
+    
+    for (const issue of statsIssues) {
+        const { 
+            state = "未知", 
+            priority = "未设置", 
+            milestone, 
+            team = "未设置", 
+            estimation, 
+            assignees 
+        } = issue;
+        
+        stats.stateStats[state] = (stats.stateStats[state] || 0) + 1;
+        stats.priorityStats[priority] = (stats.priorityStats[priority] || 0) + 1;
+        stats.milestoneStats[milestone || "未设置"] = (stats.milestoneStats[milestone || "未设置"] || 0) + 1;
+        
+        if (estimation > 0) {
+            stats.teamWorkloadStats[team] = (stats.teamWorkloadStats[team] || 0) + estimation;
+        } else {
+            stats.noEstimationCount++;
+        }
+        
+        if (assignees?.length > 0) {
+            for (const assignee of assignees) {
+                stats.assigneeStats[assignee] = (stats.assigneeStats[assignee] || 0) + 1;
+            }
+        } else {
+            stats.assigneeStats["未分配"] = (stats.assigneeStats["未分配"] || 0) + 1;
+        }
+    }
+    
+    stats.assigneeStats = sortObjectByValue(stats.assigneeStats);
+    stats.teamWorkloadStats = sortObjectByValue(stats.teamWorkloadStats);
+    
+    return stats;
+}
+
+/**
+ * 检查是否有激活的过滤器
+ */
+const hasActiveFilters = () => !!(filters.state || filters.priority || filters.milestone || filters.assignee || filters.team || filters.hasEstimation !== null);
+
+/**
+ * 应用过滤器
+ */
+function applyFilters(issues) {
+    if (!hasActiveFilters()) return issues;
+    
+    const { state, priority, milestone, assignee, team, hasEstimation } = filters;
+    
+    return issues.filter(issue => {
+        if (state && issue.state !== state) return false;
+        if (priority && issue.priority !== priority) return false;
+        if (milestone && (issue.milestone || "未设置") !== milestone) return false;
+        if (assignee) {
+            if (assignee === "未分配" ? issue.assignees?.length : !issue.assignees?.includes(assignee)) return false;
+        }
+        if (team && (issue.team || "未设置") !== team) return false;
+        // 修改：更明确的 estimation 判断
+        if (hasEstimation === true && !(issue.estimation > 0)) return false;  // 必须有且 > 0
+        if (hasEstimation === false && issue.estimation > 0) return false;     // 必须无或 = 0
+        return true;
+    });
+}
+
+/**
+ * 清除所有过滤器
+ */
+function clearAllFilters() {
+    resetFilters();
+    refreshStats();
+}
+
+/* ---------------- 颜色配置 ---------------- */
+function getStateColors() {
+    return ["#2da44e", "#cf222e", "#57606a", "#0969da", "#8250df", "#bf8700"];
+}
+
+function getPriorityColors() {
+    return ["#cf222e", "#bf8700", "#2da44e", "#6e7781"];
+}
+
+function getMilestoneColors() {
+    return ["#0969da", "#6f42c1", "#fd7e14", "#20c997", "#e83e8c", "#17a2b8"];
+}
+
+function getWorkloadColors() {
+    return ["#8250df", "#0969da", "#2da44e", "#bf8700", "#cf222e", "#fd7e14", "#e83e8c", "#17a2b8", "#6e7781"];
+}
+
+function getAssigneeColors() {
+    return ["#0969da", "#6f42c1", "#fd7e14", "#20c997", "#e83e8c", "#17a2b8", "#2da44e", "#cf222e"];
+}
+
+/* ---------------- 刷新统计界面 ---------------- */
+function refreshStats() {
+    const container = getElement("stats-container", false);
+    if (!container) return;
+    
+    destroyAllCharts();
+    
+    const filteredIssues = applyFilters(cachedIssues);
+    const stats = getStatsData(filteredIssues);
+    
+    // 移除这行，缓存逻辑有问题
+    // cachedStats = stats;
+    
+    // 构建 DOM
+    const fragment = document.createDocumentFragment();
+    
+    // 统计说明
+    fragment.appendChild(createStatsInfo(stats));
+    
+    // 过滤条件显示
+    if (hasActiveFilters()) {
+        fragment.appendChild(createFilterInfo());
+    }
+    
+    // 图表区域
+    const chartsRow = document.createElement("div");
+    chartsRow.className = "charts-row";
+    
+    const categories = getChartCategories(stats);
+    categories.forEach(category => {
+        chartsRow.appendChild(createChartWrapper(category));
+    });
+    
+    fragment.appendChild(chartsRow);
+    
+    // 一次性更新 DOM
+    container.innerHTML = "";
+    container.appendChild(fragment);
+    
+    // 延迟渲染图表
+    requestAnimationFrame(() => {
+        categories.forEach(category => {
+            renderPieChart(`chart-${category.type}`, category);
+        });
+    });
+    
+    // 渲染 Issue 列表
+    loadFilteredIssues();
+}
+
+function destroyAllCharts() {
+    chartInstances.forEach(chart => {
+        try {
+            chart.destroy();
+        } catch (e) {
+            console.warn("销毁图表失败:", e);
+        }
+    });
+    chartInstances.clear();
+}
+
+function createStatsInfo(stats) {
+    const div = document.createElement("div");
+    div.className = "stats-info";
+    
+    const { statsIssueCount, totalIssueCount } = stats;
+    const excluded = totalIssueCount - statsIssueCount;
+    
+    div.innerHTML = excluded > 0
+        ? `<span class="stats-note">📊 统计基于 ${statsIssueCount} 个顶层 Issue（已排除 ${excluded} 个子 Issue）</span>`
+        : `<span class="stats-note">📊 统计基于 ${statsIssueCount} 个 Issue</span>`;
+    
+    return div;
+}
+
+function createFilterInfo() {
+    const div = document.createElement("div");
+    div.className = "filter-info";
+    
+    const activeFilters = [];
+    if (filters.state) activeFilters.push(`状态: ${filters.state}`);
+    if (filters.priority) activeFilters.push(`优先级: ${filters.priority}`);
+    if (filters.milestone) activeFilters.push(`里程碑: ${filters.milestone}`);
+    if (filters.assignee) activeFilters.push(`分配人: ${filters.assignee}`);
+    if (filters.team) activeFilters.push(`Team: ${filters.team}`);
+    if (filters.hasEstimation === true) activeFilters.push(`工作量: 有`);
+    if (filters.hasEstimation === false) activeFilters.push(`工作量: 未设置`);
+    
+    div.innerHTML = `
+        <span class="filter-label">当前过滤：${activeFilters.join(" + ")}</span>
+        <button class="btn btn-small btn-secondary" onclick="clearAllFilters()">清除全部</button>
+    `;
+    
+    return div;
+}
+
+function getChartCategories(stats) {
+    const workloadData = { ...stats.teamWorkloadStats };
+    if (stats.noEstimationCount > 0) {
+        workloadData["未设置"] = stats.noEstimationCount;
+    }
+    
+    return [
+        { title: "状态", data: stats.stateStats, type: "state", colors: getStateColors() },
+        { title: "优先级", data: stats.priorityStats, type: "priority", colors: getPriorityColors() },
+        { title: "里程碑", data: stats.milestoneStats, type: "milestone", colors: getMilestoneColors() },
+        { title: "工作量", data: workloadData, type: "workload", colors: getWorkloadColors(), isWorkload: true },
+        { title: "分配人", data: stats.assigneeStats, type: "assignee", colors: getAssigneeColors(), paginated: true }
+    ];
+}
+
+/* ---------------- 图表组件 ---------------- */
+function createChartWrapper(category) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "chart-wrapper";
+    
+    // 标题
+    wrapper.appendChild(createChartTitle(category));
+    
+    // Canvas
+    const canvasContainer = document.createElement("div");
+    canvasContainer.className = "canvas-container";
+    
+    const canvas = document.createElement("canvas");
+    canvas.id = `chart-${category.type}`;
+    canvasContainer.appendChild(canvas);
+    wrapper.appendChild(canvasContainer);
+    
+    // 标签
+    const labelsContainer = document.createElement("div");
+    labelsContainer.className = "chart-labels";
+    labelsContainer.id = `labels-${category.type}`;
+    
+    if (category.paginated) {
+        renderPaginatedLabels(category, labelsContainer);
+    } else if (category.isWorkload) {
+        renderWorkloadLabels(category, labelsContainer);
+    } else {
+        renderLabels(category, labelsContainer);
+    }
+    
+    wrapper.appendChild(labelsContainer);
+    
+    return wrapper;
+}
+
+function createChartTitle(category) {
+    const title = document.createElement("h3");
+    
+    if (category.isWorkload) {
+        const total = Object.entries(category.data)
+            .filter(([key]) => key !== "未设置")
+            .reduce((sum, [, val]) => sum + val, 0);
+        title.innerHTML = `${category.title} <span class="workload-total">(${total})</span>`;
+        
+        if (filters.team || filters.hasEstimation !== null) {
+            title.innerHTML += ` <span class="filter-active-mark">✓</span>`;
+        }
+    } else {
+        title.textContent = category.title;
+        if (filters[category.type]) {
+            title.innerHTML += ` <span class="filter-active-mark">✓</span>`;
+        }
+    }
+    
+    return title;
+}
+
+/* ---------------- 标签渲染 ---------------- */
+function createLabelTag(text, count, color, options = {}) {
+    const tag = document.createElement("div");
+    tag.className = `label-tag${options.isActive ? " active" : ""}`;
+    tag.style.borderLeftColor = color;
+    
+    tag.dataset.filterType = options.filterType || "";
+    tag.dataset.filterValue = options.filterValue || "";
+    if (options.isWorkload) tag.dataset.isWorkload = "true";
+    
+    const countClass = options.isWorkloadValue ? "label-count workload-value" : "label-count";
+    tag.innerHTML = `<span class="label-text">${escapeHtml(text)}</span><span class="${countClass}">${count}</span>`;
+    
+    return tag;
+}
+
+// 替换 escapeHtml 函数
+
+const escapeHtmlMap = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+};
+
+function escapeHtml(str) {
+    if (!str) return "";
+    return String(str).replace(/[&<>"']/g, char => escapeHtmlMap[char]);
+}
+
+function renderLabels(category, container) {
+    const fragment = document.createDocumentFragment();
+    const colors = category.colors;
+    const data = category.data;
+    const totalCount = Object.values(data).reduce((a, b) => a + b, 0);
+    
+    // 全部标签
+    fragment.appendChild(createLabelTag("全部", totalCount, "#6e7781", {
+        filterType: category.type,
+        filterValue: "all",
+        isActive: !filters[category.type]
+    }));
+    
+    // 各项标签
+    Object.entries(data).forEach(([label, count], idx) => {
+        fragment.appendChild(createLabelTag(label, count, colors[idx % colors.length], {
+            filterType: category.type,
+            filterValue: label,
+            isActive: filters[category.type] === label
+        }));
+    });
+    
+    container.innerHTML = "";
+    container.appendChild(fragment);
+}
+
+function renderWorkloadLabels(category, container) {
+    const fragment = document.createDocumentFragment();
+    const colors = category.colors;
+    const data = category.data;
+    
+    const totalWorkload = Object.entries(data)
+        .filter(([key]) => key !== "未设置")
+        .reduce((sum, [, val]) => sum + val, 0);
+    
+    // 全部标签
+    fragment.appendChild(createLabelTag("全部", totalWorkload, "#6e7781", {
+        filterType: "workload",
+        filterValue: "all",
+        isWorkload: true,
+        isActive: !filters.team && filters.hasEstimation === null,
+        isWorkloadValue: true
+    }));
+    
+    // Team 标签
+    let colorIdx = 0;
+    Object.entries(data).forEach(([team, value]) => {
+        if (team === "未设置") return;
+        
+        fragment.appendChild(createLabelTag(team, value, colors[colorIdx % colors.length], {
+            filterType: "workload",
+            filterValue: team,
+            isWorkload: true,
+            isActive: filters.team === team && filters.hasEstimation === true,
+            isWorkloadValue: true
+        }));
+        colorIdx++;
+    });
+    
+    // 未设置标签
+    if (data["未设置"]) {
+        fragment.appendChild(createLabelTag("未设置", `${data["未设置"]} 个`, "#6e7781", {
+            filterType: "workload",
+            filterValue: "no-estimation",
+            isWorkload: true,
+            isActive: filters.hasEstimation === false
+        }));
+    }
+    
+    container.innerHTML = "";
+    container.appendChild(fragment);
+}
+
+function renderPaginatedLabels(category, container) {
+    const fragment = document.createDocumentFragment();
+    const colors = category.colors;
+    const entries = Object.entries(category.data);
+    const totalPages = Math.ceil(entries.length / ASSIGNEE_PAGE_SIZE);
+    
+    // 修正页码
+    if (assigneePage >= totalPages) {
+        assigneePage = Math.max(0, totalPages - 1);
+    }
+    
+    const startIdx = assigneePage * ASSIGNEE_PAGE_SIZE;
+    const pageEntries = entries.slice(startIdx, startIdx + ASSIGNEE_PAGE_SIZE);
+    const totalCount = entries.reduce((sum, [, count]) => sum + count, 0);
+    
+    // 全部标签
+    fragment.appendChild(createLabelTag("全部", totalCount, "#6e7781", {
+        filterType: category.type,
+        filterValue: "all",
+        isActive: !filters[category.type]
+    }));
+    
+    // 当前页标签
+    pageEntries.forEach(([label, count], idx) => {
+        const globalIdx = startIdx + idx;
+        fragment.appendChild(createLabelTag(label, count, colors[globalIdx % colors.length], {
+            filterType: category.type,
+            filterValue: label,
+            isActive: filters[category.type] === label
+        }));
+    });
+    
+    // 分页控制
+    if (totalPages > 1) {
+        const pagination = document.createElement("div");
+        pagination.className = "pagination-wrapper";
+        pagination.innerHTML = `
+            <button class="pagination-btn" data-delta="-1" data-type="${category.type}" ${assigneePage === 0 ? "disabled" : ""}>◀</button>
+            <span class="pagination-info">${assigneePage + 1}/${totalPages}</span>
+            <button class="pagination-btn" data-delta="1" data-type="${category.type}" ${assigneePage >= totalPages - 1 ? "disabled" : ""}>▶</button>
+        `;
+        fragment.appendChild(pagination);
+    }
+    
+    container.innerHTML = "";
+    container.appendChild(fragment);
+}
+
+/* ---------------- 饼图渲染 ---------------- */
+function renderPieChart(canvasId, category) {
     const canvas = document.getElementById(canvasId);
     if (!canvas) return;
     
@@ -1082,25 +1193,19 @@ function renderPieChart(canvasId, category, idx) {
     
     if (data.length === 0) return;
     
-    const colors = category.colors || [
-        "#0969da", "#6f42c1", "#fd7e14", "#20c997", "#e83e8c", "#17a2b8"
-    ];
-    
-    // 确定过滤器类型
-    const filterType = category.type;
+    const colors = category.colors;
     const isWorkload = category.isWorkload;
+    const filterType = category.type;
     
-    new Chart(canvas, {
+    const chart = new Chart(canvas, {
         type: "doughnut",
         data: {
-            labels: labels,
+            labels,
             datasets: [{
-                data: data,
-                backgroundColor: labels.map((label, i) => {
-                    // "未设置"使用灰色
-                    if (label === "未设置") return "#6e7781";
-                    return colors[i % colors.length];
-                }),
+                data,
+                backgroundColor: labels.map((label, i) => 
+                    label === "未设置" ? "#6e7781" : colors[i % colors.length]
+                ),
                 borderColor: "#ffffff",
                 borderWidth: 2
             }]
@@ -1108,400 +1213,323 @@ function renderPieChart(canvasId, category, idx) {
         options: {
             responsive: true,
             maintainAspectRatio: false,
+            animation: { duration: 300 },
             plugins: {
-                legend: {
-                    display: false
-                },
+                legend: { display: false },
                 tooltip: {
                     callbacks: {
-                        label: function(context) {
-                            const label = context.label;
-                            const value = context.parsed;
+                        label: (ctx) => {
+                            const label = ctx.label;
+                            const value = ctx.parsed;
                             if (isWorkload) {
-                                if (label === "未设置") {
-                                    return `${label}: ${value} 个 Issue`;
-                                }
-                                return `${label}: ${value} (工作量)`;
+                                return label === "未设置" 
+                                    ? `${label}: ${value} 个 Issue` 
+                                    : `${label}: ${value} (工作量)`;
                             }
                             return `${label}: ${value}`;
                         }
                     }
                 }
             },
-            onClick: (event, activeElements, chart) => {
-                if (activeElements.length > 0) {
-                    const index = activeElements[0].index;
-                    const label = labels[index];
-                    
-                    // 工作量饼图的特殊处理
-                    if (isWorkload) {
-                        if (label === "未设置") {
-                            if (filters.hasEstimation === false) {
-                                filters.team = null;
-                                filters.hasEstimation = null;
-                            } else {
-                                filters.team = null;
-                                filters.hasEstimation = false;
-                            }
-                        } else {
-                            if (filters.team === label && filters.hasEstimation === true) {
-                                filters.team = null;
-                                filters.hasEstimation = null;
-                            } else {
-                                filters.team = label;
-                                filters.hasEstimation = true;
-                            }
-                        }
-                    } else {
-                        // 使用正确的过滤器类型
-                        if (filters[filterType] === label) {
-                            filters[filterType] = null;
-                        } else {
-                            filters[filterType] = label;
-                        }
-                    }
-                    
-                    saveCachedIssues();
-                    refreshStats();
+            onClick: (event, activeElements) => {
+                if (activeElements.length === 0) return;
+                
+                const label = labels[activeElements[0].index];
+                
+                if (isWorkload) {
+                    handleWorkloadFilter(label === "未设置" ? "no-estimation" : label);
+                } else {
+                    handleNormalFilter(filterType, label);
                 }
+                
+                refreshStats();
             }
         }
     });
-}
-
-/* 根据过滤条件加载 Issue 列表 */
-function loadFilteredIssues() {
-    // 注意：这里传入的是过滤后的 issues，但父子关系需要基于原始数据
-    const filteredIssues = applyFilters(cachedIssues);
-    loadIssuesListBySession(filteredIssues, cachedIssues);
-}
-
-/* Issue 列表 */
-function loadIssuesListBySession(issues, allIssues) {
-    const c = document.getElementById("issues-details");
     
-    if (!c) return;
+    chartInstances.set(canvasId, chart);
+}
 
-    if (!issues || !issues.length) {
-        c.innerHTML = "<p>暂无 Issue</p>";
+/* ---------------- Issue 列表 ---------------- */
+function loadFilteredIssues() {
+    const filteredIssues = applyFilters(cachedIssues);
+    renderIssueList(filteredIssues, cachedIssues);
+}
+
+
+/**
+ * 获取优先级排序权重（数值越小优先级越高）
+ */
+function getPriorityWeight(priority) {
+    if (!priority) return 999;
+    const lower = priority.toLowerCase();
+    if (/p0|critical/.test(lower)) return 0;
+    if (/p1|high/.test(lower)) return 1;
+    if (/p2|medium/.test(lower)) return 2;
+    if (/p3|low/.test(lower)) return 3;
+    return 999;
+}
+
+/**
+ * Issue 排序比较函数
+ * 排序优先级：有 FunctionType 的优先 → P0 优先 → 更新时间新的优先
+ */
+function compareIssues(a, b) {
+    // 1. 有 FunctionType 的优先（有值的排前面）
+    const aHasFuncType = !!(a.FunctionType && a.FunctionType.trim());
+    const bHasFuncType = !!(b.FunctionType && b.FunctionType.trim());
+    
+    if (aHasFuncType !== bHasFuncType) {
+        return aHasFuncType ? -1 : 1;
+    }
+    
+    // 如果都有 FunctionType，按字母顺序排序
+    if (aHasFuncType && bHasFuncType) {
+        const funcTypeCompare = a.FunctionType.localeCompare(b.FunctionType);
+        if (funcTypeCompare !== 0) return funcTypeCompare;
+    }
+    
+    // 2. 优先级排序（P0 > P1 > P2 > P3 > 未设置）
+    const aPriority = getPriorityWeight(a.priority);
+    const bPriority = getPriorityWeight(b.priority);
+    
+    if (aPriority !== bPriority) {
+        return aPriority - bPriority;
+    }
+    
+    // 3. 更新时间新的优先（降序）
+    const aTime = a.updated_at ? new Date(a.updated_at).getTime() : 0;
+    const bTime = b.updated_at ? new Date(b.updated_at).getTime() : 0;
+    
+    return bTime - aTime;
+}
+
+
+function renderIssueList(issues, allIssues) {
+    const container = getElement("issues-details", false);
+    if (!container) return;
+    
+    if (!issues?.length) {
+        container.innerHTML = '<p class="no-issues">暂无 Issue</p>';
         return;
     }
-
-    // 使用所有 Issue 构建映射（包括未过滤的），以便正确建立父子关系
+    
+    // 构建索引
     const allIssueMap = new Map();
     (allIssues || issues).forEach(i => {
-        if (i.id) {
-            allIssueMap.set(i.id, i);
-        }
+        if (i.id) allIssueMap.set(i.id, i);
     });
     
-    // 过滤后的 Issue ID 集合
     const filteredIds = new Set(issues.map(i => i.id));
     
-    // 找出在当前过滤结果中的子 Issue（其父 Issue 也在过滤结果中）
-    const childIdsInFiltered = new Set();
-    issues.forEach(i => {
-        if (i.parentId && filteredIds.has(i.parentId)) {
-            childIdsInFiltered.add(i.id);
+    // 分类 Issue
+    // 1. 子 Issue 且父 Issue 在列表中 → 跟随父 Issue 显示
+    // 2. 子 Issue 但父 Issue 不在列表中 → 作为"孤立子 Issue"独立显示
+    // 3. 非子 Issue → 作为顶层 Issue 显示
+    const childrenOfFilteredParent = new Set();
+    const orphanChildren = []; // 父 Issue 不在列表中的子 Issue
+    const topLevelIssues = [];
+    
+    issues.forEach(issue => {
+        if (issue.parentId) {
+            if (filteredIds.has(issue.parentId)) {
+                // 父 Issue 在列表中，作为子 Issue 跟随显示
+                childrenOfFilteredParent.add(issue.id);
+            } else {
+                // 父 Issue 不在列表中，作为孤立子 Issue
+                orphanChildren.push(issue);
+            }
+        } else {
+            // 无父 Issue，作为顶层显示
+            topLevelIssues.push(issue);
         }
     });
     
-    // 顶层 Issue = 过滤结果中不是子 Issue 的
-    const topLevelIssues = issues.filter(i => !childIdsInFiltered.has(i.id));
+    // 合并顶层 Issue 和孤立子 Issue，一起排序
+    const displayIssues = [...topLevelIssues, ...orphanChildren].sort(compareIssues);
     
-    // 按 FunctionType 排序
-    topLevelIssues.sort((a, b) => {
-        if (!a.FunctionType) return 1;
-        if (!b.FunctionType) return -1;
-        return a.FunctionType.localeCompare(b.FunctionType);
-    });
-    
-    // 计算 Estimation 总和（只计算顶层 Issue，避免重复计算）
-    const totalEstimation = topLevelIssues.reduce((sum, i) => sum + (i.estimation || 0), 0);
-    
-    // 计算子 Issue 数量
-    const childIssueCount = childIdsInFiltered.size;
+    // 计算统计（仅统计顶层显示的 Issue，不重复计算子 Issue）
+    const totalEstimation = issues.reduce((sum, i) => sum + (i.estimation || 0), 0);
+    const childIssueCount = childrenOfFilteredParent.size;
     
     // 生成表格行
-    function generateRows() {
-        let rows = "";
-        
-        topLevelIssues.forEach(issue => {
-            // 获取当前 Issue 的子 Issue（必须在过滤结果中）
-            const children = (issue.childIds || [])
-                .filter(cid => filteredIds.has(cid))
-                .map(cid => allIssueMap.get(cid))
-                .filter(Boolean);
-            
-            const hasChildren = children.length > 0;
-            
-            // 检查 Estimation 是否匹配
-            let estimationMismatch = false;
-            if (hasChildren) {
-                const parentEstimation = issue.estimation;
-                const childrenEstimationSum = children.reduce((sum, child) => sum + (child.estimation || 0), 0);
-                const anyChildHasEstimation = children.some(child => child.estimation !== null && child.estimation > 0);
-                
-                // 只有当父 Issue 有 Estimation 且至少一个子 Issue 有 Estimation 时才检查
-                if (parentEstimation !== null && parentEstimation > 0 && anyChildHasEstimation) {
-                    estimationMismatch = parentEstimation !== childrenEstimationSum;
-                }
-            }
-            
-            const rowClass = estimationMismatch ? 'estimation-mismatch' : '';
-            const safeId = (issue.id || issue.number).toString().replace(/[^a-zA-Z0-9]/g, '_');
-            const toggleId = `toggle-${safeId}`;
-            
-            rows += `
-                <tr class="${rowClass}" data-issue-id="${issue.id || issue.number}">
-                    <td class="toggle-cell">
-                        ${hasChildren ? `<span class="toggle-arrow" onclick="toggleChildren('${toggleId}')" data-toggle="${toggleId}">▶</span>` : ''}
-                    </td>
-                    <td>${issue.FunctionType || ""}</td>
-                    <td><a class="issue-link" href="${issue.url}" target="_blank">${issue.title || ("#" + issue.number)}</a></td>
-                    <td class="status-${(issue.state || "unknown").toLowerCase()}">${issue.state || "未知"}</td>
-                    <td>${issue.assignees && issue.assignees.length ? issue.assignees.join(", ") : "未分配"}</td>
-                    <td><span class="estimation-badge">${issue.estimation !== null ? issue.estimation : "-"}</span></td>
-                    <td><span class="team-badge">${issue.team || "未设置"}</span></td>
-                    <td><span class="priority-badge priority-${priorityClass(issue.priority)}">${issue.priority || "未设置"}</span></td>
-                    <td>${issue.milestone || "未设置"}</td>
-                    <td>${issue.updated_at ? new Date(issue.updated_at).toLocaleString() : "未知"}</td>
-                </tr>`;
-            
-            // 添加子 Issue 行（默认隐藏）
-            if (hasChildren) {
-                children.forEach(child => {
-                    rows += `
-                        <tr class="child-issue hidden" data-parent="${toggleId}">
-                            <td class="toggle-cell"></td>
-                            <td class="child-indent">${child.FunctionType || ""}</td>
-                            <td class="child-indent"><span class="child-indicator">↳</span> <a class="issue-link" href="${child.url}" target="_blank">${child.title || ("#" + child.number)}</a></td>
-                            <td class="status-${(child.state || "unknown").toLowerCase()}">${child.state || "未知"}</td>
-                            <td>${child.assignees && child.assignees.length ? child.assignees.join(", ") : "未分配"}</td>
-                            <td><span class="estimation-badge">${child.estimation !== null ? child.estimation : "-"}</span></td>
-                            <td><span class="team-badge">${child.team || "未设置"}</span></td>
-                            <td><span class="priority-badge priority-${priorityClass(child.priority)}">${child.priority || "未设置"}</span></td>
-                            <td>${child.milestone || "未设置"}</td>
-                            <td>${child.updated_at ? new Date(child.updated_at).toLocaleString() : "未知"}</td>
-                        </tr>`;
-                });
-            }
-        });
-        
-        return rows;
-    }
+    const rows = displayIssues.map(issue => {
+        // 判断是否为孤立子 Issue
+        const isOrphanChild = issue.parentId && !filteredIds.has(issue.parentId);
+        return generateIssueRow(issue, filteredIds, allIssueMap, isOrphanChild);
+    }).join("");
     
-    // 构建摘要信息
+    // 摘要文本
     let summaryText = `共 ${issues.length} 个 Issue`;
-    if (childIssueCount > 0) {
-        summaryText += `（顶层 ${topLevelIssues.length} 个，子 Issue ${childIssueCount} 个）`;
-    }
+    const parts = [];
+    if (topLevelIssues.length > 0) parts.push(`顶层 ${topLevelIssues.length} 个`);
+    if (orphanChildren.length > 0) parts.push(`孤立子 Issue ${orphanChildren.length} 个`);
+    if (childIssueCount > 0) parts.push(`嵌套子 Issue ${childIssueCount} 个`);
+    if (parts.length > 0) summaryText += `（${parts.join("，")}）`;
     
-    c.innerHTML = `
-    <div class="issues-summary">
-        <span>${summaryText}</span>
-        <span>Estimation 总计: <strong>${totalEstimation}</strong></span>
-    </div>
-    <table class="issues-table" style="margin-bottom:20px;">
-        <thead>
-            <tr>
-                <th style="width: 30px;"></th>
-                <th>FunctionType</th>
-                <th>Issue</th>
-                <th>状态</th>
-                <th>分配人</th>
-                <th>Estimation</th>
-                <th>Team</th>
-                <th>优先级</th>
-                <th>里程碑</th>
-                <th>更新时间</th>
-            </tr>
-        </thead>
-        <tbody>
-            ${generateRows()}
-        </tbody>
-    </table>`;
+    // 使用 template 提升性能
+    const template = document.createElement("template");
+    template.innerHTML = `
+        <div class="issues-summary">
+            <span>${summaryText}</span>
+            <span>Estimation 总计: <strong>${totalEstimation}</strong></span>
+        </div>
+        <table class="issues-table">
+            <thead>
+                <tr>
+                    <th style="width:30px"></th>
+                    <th>FunctionType</th>
+                    <th>Issue</th>
+                    <th>状态</th>
+                    <th>分配人</th>
+                    <th>Estimation</th>
+                    <th>Team</th>
+                    <th>优先级</th>
+                    <th>里程碑</th>
+                    <th>更新时间</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>`;
+    
+    container.innerHTML = "";
+    container.appendChild(template.content.cloneNode(true));
 }
 
-/* 切换子 Issue 显示/隐藏 */
-window.toggleChildren = function(toggleId) {
+function generateIssueRow(issue, filteredIds, allIssueMap, isOrphanChild = false) {
+    // 获取子 Issue（仅父 Issue 在列表中的）
+    const children = (issue.childIds || [])
+        .filter(cid => filteredIds.has(cid))
+        .map(cid => allIssueMap.get(cid))
+        .filter(Boolean);
+    
+    const hasChildren = children.length > 0;
+    
+    // 检查 Estimation 是否匹配
+    let estimationMismatch = false;
+    if (hasChildren) {
+        const parentEst = issue.estimation || 0;
+        const childEst = children.reduce((sum, c) => sum + (c.estimation || 0), 0);
+        const anyChildHasEst = children.some(c => c.estimation > 0);
+        if (parentEst > 0 && anyChildHasEst) {
+            estimationMismatch = parentEst !== childEst;
+        }
+    }
+    
+    const toggleId = `toggle-${safeId(issue.id || issue.number)}`;
+    
+    // 生成主行（如果是孤立子 Issue，使用特殊样式）
+    let html = generateRowHtml(issue, {
+        toggleId,
+        hasChildren,
+        estimationMismatch,
+        isChild: false,
+        isOrphanChild // 新增：标记孤立子 Issue
+    });
+    
+    // 子 Issue 行（仅当有子 Issue 时）
+    if (hasChildren) {
+        children.forEach(child => {
+            html += generateRowHtml(child, {
+                toggleId,
+                hasChildren: false,
+                estimationMismatch: false,
+                isChild: true,
+                isOrphanChild: false
+            });
+        });
+    }
+    
+    return html;
+}
+
+function generateRowHtml(issue, options) {
+    const { toggleId, hasChildren, estimationMismatch, isChild, isOrphanChild } = options;
+    
+    const rowClass = [
+        isChild ? "child-issue hidden" : "",
+        isOrphanChild ? "orphan-child-issue" : "",
+        estimationMismatch ? "estimation-mismatch" : ""
+    ].filter(Boolean).join(" ");
+    
+    const dataAttr = isChild 
+        ? `data-parent="${toggleId}"` 
+        : `data-issue-id="${issue.id}"`;
+    
+    const toggleCell = hasChildren
+        ? `<span class="toggle-arrow" data-toggle="${toggleId}">▶</span>`
+        : "";
+    
+    // 孤立子 Issue 和普通子 Issue 都显示缩进指示器
+    const showIndent = isChild || isOrphanChild;
+    const titlePrefix = showIndent ? '<span class="child-indicator">↳</span> ' : "";
+    const indentClass = showIndent ? "child-indent" : "";
+    
+    return `
+        <tr class="${rowClass}" ${dataAttr}>
+            <td class="toggle-cell">${toggleCell}</td>
+            <td class="${indentClass}">${escapeHtml(issue.FunctionType || "")}</td>
+            <td class="${indentClass}">${titlePrefix}<a class="issue-link" href="${issue.url}" target="_blank">${escapeHtml(issue.title)}</a></td>
+            <td class="status-${(issue.state || "").toLowerCase().replace(/\s+/g, "-")}">${escapeHtml(issue.state || "未知")}</td>
+            <td>${escapeHtml(issue.assignees?.join(", ") || "未分配")}</td>
+            <td><span class="estimation-badge">${issue.estimation ?? "-"}</span></td>
+            <td><span class="team-badge">${escapeHtml(issue.team || "未设置")}</span></td>
+            <td><span class="priority-badge priority-${getPriorityClass(issue.priority)}">${escapeHtml(issue.priority || "未设置")}</span></td>
+            <td>${escapeHtml(issue.milestone || "未设置")}</td>
+            <td>${formatDate(issue.updated_at)}</td>
+        </tr>`;
+}
+
+/* ---------------- 子 Issue 展开/折叠 ---------------- */
+function toggleChildren(toggleId) {
     const arrow = document.querySelector(`[data-toggle="${toggleId}"]`);
     const children = document.querySelectorAll(`[data-parent="${toggleId}"]`);
     
-    if (!arrow || children.length === 0) return;
+    if (!arrow || !children.length) return;
     
     const isExpanded = arrow.classList.contains("expanded");
     
-    if (isExpanded) {
-        arrow.classList.remove("expanded");
-        arrow.textContent = "▶";
-        children.forEach(child => child.classList.add("hidden"));
-    } else {
-        arrow.classList.add("expanded");
-        arrow.textContent = "▼";
-        children.forEach(child => child.classList.remove("hidden"));
-    }
+    requestAnimationFrame(() => {
+        arrow.classList.toggle("expanded", !isExpanded);
+        arrow.textContent = isExpanded ? "▶" : "▼";
+        
+        children.forEach(child => {
+            child.classList.toggle("hidden", isExpanded);
+        });
+    });
+}
+
+/* ---------------- 导出全局函数 ---------------- */
+// 供 HTML onclick 调用
+window.saveToken = saveToken;
+window.clearToken = clearToken;
+window.fetchProjects = fetchProjects;
+window.fetchAndRefresh = fetchAndRefresh;
+window.clearAllFilters = clearAllFilters;
+
+// 新增常量定义
+const FIELD_NAMES = {
+    STATUS: "status",
+    PRIORITY: "priority",
+    ESTIMATION: "estimation",
+    TEAM: "team",
+    FUNCTION_TYPE: "functiontype"
 };
 
-/* 渲染普通标签 */
-function renderLabels(category, container) {
-    container.innerHTML = "";
-    const colors = category.colors;
-    
-    const totalCount = Object.values(category.data).reduce((a, b) => a + b, 0);
-    
-    // 添加 "全部" 标签
-    const allLabelTag = document.createElement("div");
-    allLabelTag.className = "label-tag";
-    allLabelTag.style.borderLeftColor = "#6e7781";
-    
-    const isAllActive = !filters[category.type];
-    if (isAllActive) {
-        allLabelTag.classList.add("active");
-    }
-    
-    allLabelTag.innerHTML = `<span class="label-text">全部</span><span class="label-count">${totalCount}</span>`;
-    
-    allLabelTag.addEventListener("click", () => {
-        filters[category.type] = null;
-        saveCachedIssues();
-        refreshStats();
-    });
-    
-    container.appendChild(allLabelTag);
-    
-    Object.entries(category.data).forEach(([label, count], idx) => {
-        const labelTag = document.createElement("div");
-        labelTag.className = "label-tag";
-        labelTag.style.borderLeftColor = colors[idx % colors.length];
-        
-        const isActive = filters[category.type] === label;
-        if (isActive) {
-            labelTag.classList.add("active");
-        }
-        
-        labelTag.innerHTML = `<span class="label-text">${label}</span><span class="label-count">${count}</span>`;
-        
-        labelTag.addEventListener("click", () => {
-            if (filters[category.type] === label) {
-                filters[category.type] = null;
-            } else {
-                filters[category.type] = label;
-            }
-            
-            saveCachedIssues();
-            refreshStats();
-        });
-        
-        container.appendChild(labelTag);
-    });
-}
+const ISSUE_STATE = {
+    CLOSED: "CLOSED",
+    OPEN: "OPEN"
+};
 
-/* 渲染分页标签（分配人专用） */
-function renderPaginatedLabels(category, container) {
-    container.innerHTML = "";
-    const colors = category.colors;
-    const entries = Object.entries(category.data);
-    const totalPages = Math.ceil(entries.length / ASSIGNEE_PAGE_SIZE);
-    
-    if (assigneePage >= totalPages) {
-        assigneePage = Math.max(0, totalPages - 1);
-    }
-    
-    const startIdx = assigneePage * ASSIGNEE_PAGE_SIZE;
-    const endIdx = Math.min(startIdx + ASSIGNEE_PAGE_SIZE, entries.length);
-    const pageEntries = entries.slice(startIdx, endIdx);
-    
-    const totalCount = Object.values(category.data).reduce((a, b) => a + b, 0);
-    
-    // 添加 "全部" 标签
-    const allLabelTag = document.createElement("div");
-    allLabelTag.className = "label-tag";
-    allLabelTag.style.borderLeftColor = "#6e7781";
-    
-    const isAllActive = !filters[category.type];
-    if (isAllActive) {
-        allLabelTag.classList.add("active");
-    }
-    
-    allLabelTag.innerHTML = `<span class="label-text">全部</span><span class="label-count">${totalCount}</span>`;
-    
-    allLabelTag.addEventListener("click", () => {
-        filters[category.type] = null;
-        saveCachedIssues();
-        refreshStats();
-    });
-    
-    container.appendChild(allLabelTag);
-    
-    // 渲染当前页的标签
-    pageEntries.forEach(([label, count], idx) => {
-        const globalIdx = startIdx + idx;
-        const labelTag = document.createElement("div");
-        labelTag.className = "label-tag";
-        labelTag.style.borderLeftColor = colors[globalIdx % colors.length];
-        
-        const isActive = filters[category.type] === label;
-        if (isActive) {
-            labelTag.classList.add("active");
-        }
-        
-        labelTag.innerHTML = `<span class="label-text">${label}</span><span class="label-count">${count}</span>`;
-        
-        labelTag.addEventListener("click", () => {
-            if (filters[category.type] === label) {
-                filters[category.type] = null;
-            } else {
-                filters[category.type] = label;
-            }
-            
-            saveCachedIssues();
-            refreshStats();
-        });
-        
-        container.appendChild(labelTag);
-    });
-    
-    // 添加分页控制
-    if (totalPages > 1) {
-        const paginationWrapper = document.createElement("div");
-        paginationWrapper.className = "pagination-wrapper";
-        
-        const prevBtn = document.createElement("button");
-        prevBtn.className = "pagination-btn";
-        prevBtn.innerHTML = "◀";
-        prevBtn.disabled = assigneePage === 0;
-        prevBtn.addEventListener("click", (e) => {
-            e.stopPropagation();
-            if (assigneePage > 0) {
-                assigneePage--;
-                saveCachedIssues();
-                renderPaginatedLabels(category, container);
-            }
-        });
-        
-        const pageInfo = document.createElement("span");
-        pageInfo.className = "pagination-info";
-        pageInfo.textContent = `${assigneePage + 1}/${totalPages}`;
-        
-        const nextBtn = document.createElement("button");
-        nextBtn.className = "pagination-btn";
-        nextBtn.innerHTML = "▶";
-        nextBtn.disabled = assigneePage >= totalPages - 1;
-        nextBtn.addEventListener("click", (e) => {
-            e.stopPropagation();
-            if (assigneePage < totalPages - 1) {
-                assigneePage++;
-                saveCachedIssues();
-                renderPaginatedLabels(category, container);
-            }
-        });
-        
-        paginationWrapper.appendChild(prevBtn);
-        paginationWrapper.appendChild(pageInfo);
-        paginationWrapper.appendChild(nextBtn);
-        
-        container.appendChild(paginationWrapper);
-    }
-}
+// 添加全局错误处理
+
+window.addEventListener("error", (event) => {
+    console.error("全局错误:", event.error);
+    hideLoading();
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+    console.error("未处理的 Promise 错误:", event.reason);
+    hideLoading();
+});
 

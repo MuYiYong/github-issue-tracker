@@ -889,3 +889,26 @@ input[type="password"]:focus {
 .estimation-mismatch:hover {
     background-color: #ffebe9 !important;
 }
+
+/* ================================
+   孤立子 Issue 样式（父 Issue 不在列表中）
+================================ */
+
+.orphan-child-issue {
+    background-color: #fffbeb; /* 淡黄色背景，区分于普通 Issue */
+}
+
+.orphan-child-issue:hover {
+    background-color: #fef3c7;
+}
+
+/* 暗色模式 */
+@media (prefers-color-scheme: dark) {
+    .orphan-child-issue {
+        background-color: #422006;
+    }
+    
+    .orphan-child-issue:hover {
+        background-color: #713f12;
+    }
+}
