@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>GitHub Issue Tracker - 统计</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <script src="script.js" defer></script>
+</head>
+<body>
+    <nav class="main-nav">
+        <a href="index.html" class="nav-link">首页</a>
+        <a href="config.html" class="nav-link">配置</a>
+        <a href="stats.html" class="nav-link active">统计</a>
+    </nav>
+
+    <div class="page-header">
+        <h1>Issue 统计</h1>
+        <div class="header-actions">
+            <select id="project-select" class="select-field">
+                <option value="">-- 请选择 Project --</option>
+            </select>
+            <button class="btn btn-primary" onclick="fetchAndRefreshStats()">
+                <span class="btn-icon">🔄</span>
+                拉取并刷新
+            </button>
+        </div>
+    </div>
+    <div id="last-fetch-time" class="last-fetch-time"></div>
+
+    <div id="stats-container" class="stats-container"></div>
+
+    <hr>
+
+    <h2>Issue 列表</h2>
+    <div id="issues-details"></div>
+</body>
+</html>

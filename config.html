@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>GitHub Issue Tracker - 配置</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="script.js" defer></script>
+</head>
+<body>
+    <nav class="main-nav">
+        <a href="index.html" class="nav-link">首页</a>
+        <a href="config.html" class="nav-link active">配置</a>
+        <a href="stats.html" class="nav-link">统计</a>
+    </nav>
+
+    <h1>配置</h1>
+    
+    <div class="config-section">
+        <h2>GitHub Token</h2>
+        <p class="hint">需要 <code>read:project</code> 和 <code>repo</code> 权限</p>
+        <div class="input-group">
+            <input type="password" id="github-token" placeholder="输入 GitHub Token" class="input-field">
+            <button class="btn btn-primary" onclick="saveToken()">保存 Token</button>
+        </div>
+    </div>
+
+    <hr>
+
+    <div class="config-section">
+        <h2>选择 Project</h2>
+        <div class="input-group">
+            <select id="project-select" class="select-field">
+                <option value="">-- 请先加载 Project 列表 --</option>
+            </select>
+            <button class="btn btn-secondary" onclick="loadMyProjects()">
+                <span class="btn-icon">📂</span>
+                加载我的 Project
+            </button>
+        </div>
+        <p id="project-status" class="status-text"></p>
+        <p class="hint">选择 Project 后，打开统计页面会自动拉取该 Project 的 Issue</p>
+    </div>
+</body>
+</html>

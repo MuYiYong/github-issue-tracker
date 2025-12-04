@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GitHub Issue Tracker</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <!-- 导航栏 -->
+    <nav class="main-nav">
+        <div class="nav-brand">
+            <span class="nav-logo">📊</span>
+            <span class="nav-title">Issue Tracker</span>
+        </div>
+        <div class="nav-tabs">
+            <button class="nav-tab active" data-tab="stats">
+                <span class="nav-tab-icon">📈</span>
+                统计
+            </button>
+            <button class="nav-tab" data-tab="config">
+                <span class="nav-tab-icon">⚙️</span>
+                配置
+            </button>
+        </div>
+    </nav>
+    
+    <!-- 主内容区 -->
+    <main class="main-content">
+        <!-- 统计页面 -->
+        <section id="tab-stats" class="tab-content active">
+            <!-- 项目选择器和操作栏 -->
+            <div class="action-bar">
+                <div class="project-selector">
+                    <label for="project-select">选择项目：</label>
+                    <select id="project-select">
+                        <option value="">-- 请选择 --</option>
+                    </select>
+                </div>
+                <div class="action-buttons">
+                    <button id="fetch-btn" class="btn btn-primary" onclick="fetchAndRefresh()">
+                        <span class="btn-icon">🔄</span> 拉取并刷新
+                    </button>
+                    <span id="last-fetch-time" class="last-fetch-time"></span>
+                </div>
+            </div>
+            
+            <!-- 加载进度条 -->
+            <div id="loading-container" class="loading-container hidden">
+                <div class="loading-header">
+                    <span class="loading-icon">⏳</span>
+                    <span id="loading-text" class="loading-text">正在加载...</span>
+                    <span id="loading-percent" class="loading-percent">0%</span>
+                </div>
+                <div class="loading-bar-wrapper">
+                    <div id="loading-bar-fill" class="loading-bar-fill"></div>
+                </div>
+                <div id="loading-detail" class="loading-detail"></div>
+            </div>
+            
+            <!-- 统计图表 -->
+            <div id="stats-container" class="stats-container"></div>
+            
+            <!-- Issue 列表 -->
+            <div id="issues-details"></div>
+        </section>
+        
+        <!-- 配置页面 -->
+        <section id="tab-config" class="tab-content">
+            <div class="config-card">
+                <h2>🔑 Token 配置</h2>
+                <p class="config-desc">请输入您的 GitHub Personal Access Token，用于访问 GitHub API。</p>
+                <div class="token-input-group">
+                    <input type="password" id="token-input" placeholder="ghp_xxxxxxxxxxxx" />
+                    <button class="btn btn-primary" onclick="saveToken()">保存</button>
+                    <button class="btn btn-danger" onclick="clearToken()">清除</button>
+                </div>
+                <div id="token-status" class="token-status"></div>
+            </div>
+            
+            <div class="config-card">
+                <h2>📂 项目列表</h2>
+                <p class="config-desc">点击下方按钮获取您有权限访问的 GitHub Projects。</p>
+                <button class="btn btn-secondary" onclick="fetchProjects()">
+                    <span class="btn-icon">🔄</span> 获取项目列表
+                </button>
+                <div id="projects-list" class="projects-list"></div>
+            </div>
+        </section>
+    </main>
+    
+    <script src="script.js"></script>
+</body>
+</html>
